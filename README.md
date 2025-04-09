@@ -9,7 +9,7 @@ For complete documentation, please visit: [documentation.oblix.ai](https://docum
 - **Unified Model Interface**: Consistent API across different model providers (OpenAI, Claude, Ollama)
 - **Intelligent Orchestration**: Automatic switching between local and cloud models based on system resources and connectivity
 - **Session Management**: Create, load, export, and import conversation sessions
-- **Streaming Support**: Real-time token streaming 
+- **Streaming Support**: Real-time token streaming
 - **Extensible Agent System**: Custom monitoring and decision-making policies
 - **OpenAI-Compatible API**: Drop-in compatibility with applications built for OpenAI's API
 
@@ -57,7 +57,7 @@ Oblix provides an OpenAI-compatible endpoint that allows using the standard Open
 
 ```bash
 # Start the Oblix server
-uvicorn oblix.main:app --host 0.0.0.0 --port 8000
+uvicorn oblix.main:app --host 0.0.0.0 --port 8140
 ```
 
 ### Client Usage
@@ -67,7 +67,7 @@ from openai import OpenAI
 
 # Point to local Oblix server
 client = OpenAI(
-    base_url="http://localhost:8000/v1",
+    base_url="http://localhost:8140/v1",
     api_key="any-value"  # Authentication not required
 )
 
@@ -86,7 +86,7 @@ print(completion.choices[0].message.content)
 
 # Streaming also works
 stream = client.chat.completions.create(
-    model="openai:gpt-3.5-turbo", 
+    model="openai:gpt-3.5-turbo",
     messages=[{"role": "user", "content": "Write a poem"}],
     stream=True,
 )
