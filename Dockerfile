@@ -1,7 +1,9 @@
 FROM python:3.13.3-alpine
 
-# Install oblix package using pip
+# Install oblix package using pip ( once OS-independent )
 RUN pip install oblix
+
+WORKDIR /oblix
 
 EXPOSE 8140
 
