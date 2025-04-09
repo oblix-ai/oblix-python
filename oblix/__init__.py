@@ -17,7 +17,7 @@ Examples:
     from oblix import OblixClient, ModelType
     
     # Initialize client
-    client = OblixClient(oblix_api_key="your_api_key")
+    client = OblixClient()
     
     # Hook models
     await client.hook_model(ModelType.OLLAMA, "llama2")
@@ -48,9 +48,6 @@ from .models.base import ModelType
 # Core agent classes
 from .agents.base import BaseAgent
 
-# Authentication classes
-from .auth import OblixAuth, APIKeyValidationError, RateLimitExceededError
-
 # Export main client class with alternative name for convenience
 Oblix = OblixClient
 
@@ -66,17 +63,12 @@ __all__ = [
     # Agent classes
     'BaseAgent',
     
-    # Authentication
-    'OblixAuth',
-    'APIKeyValidationError',
-    'RateLimitExceededError',
-    
     # Version utilities
     'version_info',
     'check_for_updates'
 ]
 
-__version__ = '0.1.0'
+__version__ = '0.1.2'
 
 def version_info():
     """

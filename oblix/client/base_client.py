@@ -12,7 +12,6 @@ from ..agents.resource_monitor import ResourceMonitor
 from ..agents.connectivity import BaseConnectivityAgent
 from ..config.manager import ConfigManager
 from ..sessions.manager import SessionManager
-from ..auth import OblixAuth, APIKeyValidationError
 from ..core.execution import ExecutionManager
 
 logger = logging.getLogger(__name__)
@@ -22,15 +21,13 @@ class OblixBaseClient:
     Base infrastructure class for Oblix SDK.
     
     The OblixBaseClient provides the foundational infrastructure for the Oblix SDK,
-    including API authentication, model management, agent registration,
-    configuration persistence, session management, and resource cleanup.
+    including model management, agent registration, configuration persistence, 
+    session management, and resource cleanup.
     
     This class is designed to be extended by more specific client implementations
     that provide higher-level, developer-friendly interfaces.
     
     Attributes:
-        oblix_api_key (str): API key for Oblix services authentication
-        auth (OblixAuth): Authentication handler
         host (str): Server host address
         port (int): Server port number
         config_manager (ConfigManager): Configuration persistence manager
@@ -41,51 +38,24 @@ class OblixBaseClient:
         is_connected (bool): Connection status
         
     Args:
-        oblix_api_key (Optional[str]): Oblix API key for authentication
         host (str): Server host address (default: "localhost")
         port (int): Server port number (default: 4321)
         config_path (Optional[str]): Path to configuration file
-        
-    Raises:
-        ValueError: If API key is missing and not in environment variable
     """
     
     def __init__(self, 
-                 oblix_api_key: Optional[str] = None,
                  host: str = "localhost", 
                  port: int = 4321,
                  config_path: Optional[str] = None):
         """
-        Initialize Oblix Base Client with authentication and configuration.
+        Initialize Oblix Base Client with configuration.
         
         Args:
-            oblix_api_key: Oblix API key for authentication
             host: Server host address
             port: Server port number
             config_path: Path to configuration file
-            
-        Raises:
-            ValueError: If API key is missing and not in environment variable
         """
         try:
-            # Check environment for API key if not provided
-            self.oblix_api_key = oblix_api_key or os.getenv('OBLIX_API_KEY')
-            
-            if not self.oblix_api_key:
-                print("\n=== Oblix Authentication Required ===")
-                print("Error: Oblix API key is missing!")
-                print("\nTo fix this, either:")
-                print("1. Set the OBLIX_API_KEY environment variable:")
-                print("   export OBLIX_API_KEY=your_api_key")
-                print("\n2. Or provide it in the constructor:")
-                print("   client = OblixClient(oblix_api_key='your_api_key')")
-                print("\nNeed an API key? Visit: https://oblixai.com")
-                print("========================================\n")
-                raise ValueError("Oblix API key is missing")
-            
-            # Initialize authentication
-            self.auth = OblixAuth(self.oblix_api_key)
-            
             self.host = host
             self.port = port
             
@@ -107,7 +77,6 @@ class OblixBaseClient:
             self.execution_manager = ExecutionManager()
             
             # Track requirements
-            self._is_authenticated = False
             self._has_local_model = False
             self._has_cloud_model = False
             self._has_resource_monitor = False
@@ -124,50 +93,15 @@ class OblixBaseClient:
             logger.error(f"Error initializing Oblix client: {str(e)}")
             raise
 
-    async def _ensure_authenticated(self) -> bool:
-        """
-        Ensure the client is authenticated with valid API key.
-        
-        Validates the API key with the Oblix authentication service
-        and caches the result for subsequent calls.
-        
-        Returns:
-            bool: True if authenticated, False otherwise
-            
-        Raises:
-            APIKeyValidationError: If authentication fails and strict validation is enabled
-        """
-        if not self._is_authenticated:
-            try:
-                await self.auth.validate_key()
-                self._is_authenticated = True
-                logger.info("Authentication successful")
-            except APIKeyValidationError as e:
-                # With local validation enabled, we should never reach this point
-                # But in case we do, handle it gracefully
-                strict_validation = os.environ.get('OBLIX_STRICT_VALIDATION', 'false').lower() == 'true'
-                if strict_validation:
-                    logger.error(f"Authentication failed: {str(e)}")
-                    raise
-                else:
-                    logger.warning(f"Authentication warning: {str(e)}")
-                    # For non-strict mode, consider authenticated anyway for better UX
-                    self._is_authenticated = True
-        return self._is_authenticated
-
     async def _validate_requirements(self):
         """
         Validate all required components are set up.
         
-        Checks that authentication is complete and that required
-        models and agents are hooked.
+        Checks that required models and agents are hooked.
         
         Raises:
             RuntimeError: If any requirement is not satisfied
         """
-        if not self._is_authenticated:
-            raise RuntimeError("API key not validated. Call _ensure_authenticated() first")
-        
         if not self._has_local_model:
             raise RuntimeError("Local model not hooked. Hook an Ollama model first")
             
@@ -205,9 +139,6 @@ class OblixBaseClient:
         Note:
             The model is stored with an ID in the format "{model_type}:{model_name}"
         """
-        # Ensure authenticated before proceeding
-        await self._ensure_authenticated()
-        
         try:
             # Prepare model configuration
             config = {
@@ -222,11 +153,29 @@ class OblixBaseClient:
             if api_key:
                 config['api_key'] = api_key
             
-            # Create and initialize model
-            if not hasattr(self, 'model_factory'):
-                self.model_factory = ModelFactory()
+            # Special handling for Claude model
+            if model_type == ModelType.CLAUDE:
+                logger.debug(f"Direct initialization of Claude model: {model_name}")
+                from ..models.claude import ClaudeModel
                 
-            model = await self.model_factory.create_model(config)
+                # Create Claude model directly
+                model = ClaudeModel(
+                    model_name=model_name,
+                    api_key=api_key,
+                    max_tokens=config.get('max_tokens')
+                )
+                
+                # Initialize the model
+                if not await model.initialize():
+                    logger.error(f"Failed to initialize Claude model: {model_name}")
+                    return False
+            else:
+                # Create and initialize other model types through factory
+                if not hasattr(self, 'model_factory'):
+                    self.model_factory = ModelFactory()
+                    
+                model = await self.model_factory.create_model(config)
+                
             if not model:
                 logger.error(f"Failed to create model: {model_type}:{model_name}")
                 return False
@@ -252,7 +201,7 @@ class OblixBaseClient:
                 api_key=config.get('api_key')
             )
             
-            logger.info(f"Successfully hooked model: {model_id}")
+            logger.debug(f"Successfully hooked model: {model_id}")
             return True
         
         except Exception as e:
@@ -293,7 +242,7 @@ class OblixBaseClient:
             # Register with execution manager for orchestration
             self.execution_manager.register_agent(agent)
             
-            logger.info(f"Successfully hooked agent: {agent.name}")
+            logger.debug(f"Successfully hooked agent: {agent.name}")
             return True
         
         except Exception as e:
@@ -342,7 +291,7 @@ class OblixBaseClient:
         Gracefully shut down all models and agents.
         
         Closes all connections, releases resources, and performs cleanup
-        for all registered models, agents, and the authentication client.
+        for all registered models and agents.
         
         This method should be called when the application is closing to
         ensure proper resource management.
@@ -364,10 +313,6 @@ class OblixBaseClient:
                 logger.info(f"Shutdown agent: {agent_name}")
             except Exception as e:
                 logger.error(f"Error shutting down agent {agent_name}: {e}")
-        
-        # Cleanup auth session
-        if hasattr(self, 'auth'):
-            await self.auth.cleanup()
             
     def _check_for_updates(self):
         """

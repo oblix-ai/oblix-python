@@ -4,15 +4,30 @@ import logging
 import os
 import asyncio
 import uuid
+import json
 from datetime import datetime
+import sys
+import gc
 
 from .base_client import OblixBaseClient
 from ..models.base import ModelType
 from ..agents.base import BaseAgent
 from ..agents.resource_monitor import ResourceMonitor
 from ..agents.connectivity import ConnectivityAgent
+from ..agents.connectivity.policies import ConnectivityState, ConnectionTarget
 
 logger = logging.getLogger(__name__)
+
+# Helper function for user-friendly error printing
+def print_error(message):
+    """Print error message in red if available, otherwise standard print"""
+    try:
+        # Try to use colorama if available
+        from colorama import Fore, Style
+        print(f"{Fore.RED}{Style.BRIGHT}{message}{Style.RESET_ALL}")
+    except ImportError:
+        # Fallback to standard print
+        print(f"ERROR: {message}")
 
 class OblixClient(OblixBaseClient):
     """
@@ -33,7 +48,7 @@ class OblixClient(OblixBaseClient):
     
     Examples:
         # Initialize client
-        client = OblixClient(oblix_api_key="your_api_key")
+        client = OblixClient()
         
         # Hook models
         await client.hook_model(ModelType.OLLAMA, "llama2")
@@ -53,7 +68,6 @@ class OblixClient(OblixBaseClient):
 
     async def execute(self, 
                      prompt: str, 
-                     model_id: Optional[str] = None,
                      temperature: Optional[float] = None,
                      max_tokens: Optional[int] = None,
                      request_id: Optional[str] = None,
@@ -69,7 +83,6 @@ class OblixClient(OblixBaseClient):
         
         Args:
             prompt (str): User prompt to process
-            model_id (Optional[str]): Specific model to use (optional)
             temperature (Optional[float]): Sampling temperature for text generation
             max_tokens (Optional[int]): Maximum tokens to generate
             request_id (Optional[str]): Custom request identifier for tracking
@@ -85,12 +98,20 @@ class OblixClient(OblixBaseClient):
         Raises:
             RuntimeError: If requirements validation fails
         """
-        # Validate all requirements are met
-        await self._validate_requirements()
-        
         # Generate request ID if not provided
         if not request_id:
             request_id = str(uuid.uuid4())
+            
+        try:
+            # Validate all requirements are met
+            await self._validate_requirements()
+        except Exception as e:
+            # Handle validation errors
+            logger.error(f"Validation error in execute: {e}")
+            return {
+                "request_id": request_id,
+                "error": str(e)
+            }
         
         try:
             # Get conversation context if session exists
@@ -119,32 +140,11 @@ class OblixClient(OblixBaseClient):
             # Add any additional kwargs
             parameters.update(kwargs)
             
-            # Determine model type and model name from model_id if provided
+            # No model selection - rely entirely on policy-based orchestration in ExecutionManager
             model_type = None
             model_name = None
-            if model_id:
-                if ':' in model_id:
-                    model_type_str, model_name = model_id.split(':', 1)
-                    try:
-                        model_type = ModelType(model_type_str)
-                    except ValueError:
-                        logger.error(f"Invalid model type: {model_type_str}")
-                        return {
-                            "request_id": request_id,
-                            "error": f"Invalid model type: {model_type_str}"
-                        }
-                else:
-                    # Try to find model by ID
-                    model = self.models.get(model_id)
-                    if model:
-                        model_type = model.model_type
-                        model_name = model.model_name
-                    else:
-                        logger.error(f"Model {model_id} not found")
-                        return {
-                            "request_id": request_id,
-                            "error": f"Model {model_id} not found"
-                        }
+            
+            logger.info("Executing with pure policy-based orchestration")
             
             # Use ExecutionManager for orchestration and model selection
             execution_result = await self.execution_manager.execute(
@@ -172,21 +172,42 @@ class OblixClient(OblixBaseClient):
                         role='user'
                     )
                     
-                    # Save assistant message
+                    # Save assistant message - ensure it's properly formatted
+                    if isinstance(response, str):
+                        message_to_save = response
+                    elif isinstance(response, dict):
+                        # Don't wrap an existing dict in another dict
+                        message_to_save = response
+                    else:
+                        # For other types, convert to string
+                        message_to_save = str(response)
+                        
                     self.session_manager.save_message(
                         self.current_session_id,
-                        response,
+                        message_to_save,
                         role='assistant'
                     )
                 except Exception as e:
                     logger.warning(f"Error saving session messages: {e}")
             
+            # Calculate metrics 
+            metrics = {}
+            
+            # For non-streaming responses, metrics are in the execution_result
+            metrics = execution_result.get('metrics', {})
+            
+            # Ensure response is a string
+            if isinstance(response, dict):
+                response_str = str(response)
+            else:
+                response_str = str(response)
+                
             # Return response with execution metadata
             return {
                 "request_id": request_id,
                 "model_id": execution_result.get('model_id', ''),
-                "response": response,
-                "metrics": execution_result.get('metrics', {}),
+                "response": response_str,  # Ensure response is a string
+                "metrics": metrics,
                 "agent_checks": execution_result.get('agent_checks', []),
                 "routing_decision": execution_result.get('routing_decision', {})
             }
@@ -200,10 +221,10 @@ class OblixClient(OblixBaseClient):
             
     async def execute_streaming(self, 
                           prompt: str, 
-                          model_id: Optional[str] = None,
                           temperature: Optional[float] = None,
                           max_tokens: Optional[int] = None,
                           request_id: Optional[str] = None,
+                          display_metrics: bool = True,
                           **kwargs) -> Optional[Dict[str, Any]]:
         """
         Execute a prompt with streaming output directly to the terminal.
@@ -213,10 +234,10 @@ class OblixClient(OblixBaseClient):
         
         Args:
             prompt (str): User prompt to process
-            model_id (Optional[str]): Specific model to use (optional)
             temperature (Optional[float]): Sampling temperature for text generation
             max_tokens (Optional[int]): Maximum tokens to generate
             request_id (Optional[str]): Custom request identifier for tracking
+            display_metrics (bool): Whether to display performance metrics
             **kwargs: Additional model-specific generation parameters
         
         Returns:
@@ -229,12 +250,20 @@ class OblixClient(OblixBaseClient):
         Raises:
             RuntimeError: If requirements validation fails
         """
-        # Validate all requirements are met
-        await self._validate_requirements()
-        
         # Generate request ID if not provided
         if not request_id:
             request_id = str(uuid.uuid4())
+            
+        try:
+            # Validate all requirements are met
+            await self._validate_requirements()
+        except Exception as e:
+            # Handle validation errors
+            logger.error(f"Validation error in execute_streaming: {e}")
+            return {
+                "request_id": request_id,
+                "error": str(e)
+            }
         
         try:
             # Get conversation context if session exists
@@ -264,32 +293,12 @@ class OblixClient(OblixBaseClient):
             # Add any additional kwargs
             parameters.update(kwargs)
             
-            # Determine model type and model name from model_id if provided
+            # No model selection or redundant connectivity checks here - relying entirely on the ExecutionManager's orchestration
+            # which will check connectivity and resource policies automatically
             model_type = None
             model_name = None
-            if model_id:
-                if ':' in model_id:
-                    model_type_str, model_name = model_id.split(':', 1)
-                    try:
-                        model_type = ModelType(model_type_str)
-                    except ValueError:
-                        logger.error(f"Invalid model type: {model_type_str}")
-                        return {
-                            "request_id": request_id,
-                            "error": f"Invalid model type: {model_type_str}"
-                        }
-                else:
-                    # Try to find model by ID
-                    model = self.models.get(model_id)
-                    if model:
-                        model_type = model.model_type
-                        model_name = model.model_name
-                    else:
-                        logger.error(f"Model {model_id} not found")
-                        return {
-                            "request_id": request_id,
-                            "error": f"Model {model_id} not found"
-                        }
+            
+            logger.info("Executing streaming with pure policy-based orchestration")
                         
             # Use ExecutionManager for orchestration
             execution_result = await self.execution_manager.execute(
@@ -307,16 +316,13 @@ class OblixClient(OblixBaseClient):
             # Get the model that was selected
             model_identifier = execution_result.get('model_id', 'Unknown model')
             
-            # Print which model was selected
-            print(f"\nUsing model: {model_identifier}")
-            
             # Get the response text from execution result (may already be complete for non-streaming models)
             if 'response' in execution_result:
-                print(execution_result['response'])
+                print(f"\nA: {execution_result['response']}")
                 full_response = execution_result['response']
             else:
                 # Otherwise we expect streaming data from the execution
-                print("\nAssistant: ", end="", flush=True)
+                print("\nA: ", end="", flush=True)
                 full_response = ""
                 
                 # Extract streaming content if available
@@ -333,6 +339,58 @@ class OblixClient(OblixBaseClient):
                     print("\nError: No streaming response available")
                     full_response = "Streaming response not available"
                 
+                # Calculate metrics regardless of whether we display them
+                import json
+                
+                # Retrieve metrics from model instance after streaming is complete
+                metrics = {}
+                
+                # For streaming responses, metrics are stored in the model's last_metrics property
+                if 'model_instance' in execution_result:
+                    model_instance = execution_result.get('model_instance')
+                    if hasattr(model_instance, 'last_metrics') and model_instance.last_metrics:
+                        metrics = model_instance.last_metrics
+                else:
+                    # Fallback to any metrics directly in the execution result
+                    metrics = execution_result.get("metrics", {})
+                
+                # Format metrics using helper function
+                enhanced_metrics = self.format_metrics(metrics)
+                
+                # Extract model type and name from model_id
+                model_type = model_identifier.split(":")[0] if ":" in model_identifier else ""
+                model_name = model_identifier.split(":")[1] if ":" in model_identifier else model_identifier
+                
+                # Create a response object with the required fields
+                response_json = {
+                    "response": full_response,
+                    "model_name": model_name,
+                    "model_type": model_type,
+                    "time_to_first_token": enhanced_metrics.get("time_to_first_token"),
+                    "tokens_per_second": enhanced_metrics.get("tokens_per_second"),
+                    "latency": enhanced_metrics.get("total_latency"),
+                    "input_tokens": enhanced_metrics.get("input_tokens"),
+                    "output_tokens": enhanced_metrics.get("output_tokens")
+                }
+                
+                # Remove null values
+                response_json = {k: v for k, v in response_json.items() if v is not None}
+                
+                # Only display metrics if requested (controlled by display_metrics parameter)
+                if display_metrics:
+                    print(f"\nJSON response:\n{json.dumps(response_json, indent=2)}")
+                    
+                    # Display routing decisions after the JSON
+                    if execution_result.get('routing_decision'):
+                        resource_routing = execution_result['routing_decision'].get('resource_routing')
+                        connectivity_routing = execution_result['routing_decision'].get('connectivity_routing')
+                        
+                        print("\nRouting decisions:")
+                        if resource_routing:
+                            print(f"Resource: {{\n  'target': '{resource_routing.get('target')}',\n  'state': '{resource_routing.get('state')}',\n  'reason': '{resource_routing.get('reason')}'\n}}")
+                        if connectivity_routing:
+                            print(f"Connectivity: {{\n  'state': '{connectivity_routing.get('state')}',\n  'target': '{connectivity_routing.get('target')}',\n  'reason': '{connectivity_routing.get('reason')}'\n}}")
+            
             # Save to session if active
             if self.current_session_id:
                 try:
@@ -343,21 +401,40 @@ class OblixClient(OblixBaseClient):
                         role='user'
                     )
                     
-                    # Save assistant message
+                    # Save assistant message - ensure it's properly formatted
+                    if isinstance(full_response, str):
+                        message_to_save = full_response
+                    elif isinstance(full_response, dict):
+                        # Don't wrap an existing dict in another dict
+                        message_to_save = full_response
+                    else:
+                        # For other types, convert to string
+                        message_to_save = str(full_response)
+                        
                     self.session_manager.save_message(
                         self.current_session_id,
-                        full_response,
+                        message_to_save,
                         role='assistant'
                     )
                 except Exception as e:
                     logger.warning(f"Error saving session messages: {e}")
             
+            # Ensure metrics are also included in the return value
+            # Use the same metrics retrieval logic as above
+            metrics = {}
+            if 'model_instance' in execution_result:
+                model_instance = execution_result.get('model_instance')
+                if hasattr(model_instance, 'last_metrics') and model_instance.last_metrics:
+                    metrics = model_instance.last_metrics
+            else:
+                metrics = execution_result.get('metrics', {})
+                
             # Return response with execution metadata
             return {
                 "request_id": request_id,
                 "model_id": model_identifier,
                 "response": full_response,
-                "metrics": execution_result.get('metrics', {}),
+                "metrics": metrics,
                 "agent_checks": execution_result.get('agent_checks', []),
                 "routing_decision": execution_result.get('routing_decision', {})
             }
@@ -387,8 +464,13 @@ class OblixClient(OblixBaseClient):
             - Use '/list' to see recent sessions
             - Use '/load <session_id>' to load a previous session
         """
-        # Validate all requirements are met
-        await self._validate_requirements()
+        try:
+            # Validate all requirements are met
+            await self._validate_requirements()
+        except Exception as e:
+            # Handle validation errors
+            print_error(f"Error starting chat: {e}")
+            return None
         
         # Create or load session
         if session_id:
@@ -467,110 +549,88 @@ class OblixClient(OblixBaseClient):
         
         return self.current_session_id
     
-    def _select_model_from_agent_checks(self, agent_checks: Dict[str, Any]) -> Optional[Any]:
-        """
-        Select the best model based on agent check results.
-        
-        Analyzes agent check results to determine the optimal model for execution
-        based on resource availability and connectivity status.
-        
-        Args:
-            agent_checks (Dict[str, Any]): Results from agent checks
-        
-        Returns:
-            Optional[Any]: Selected model instance or None
-        """
-        # Default to None
-        selected_model = None
-        
-        try:
-            # Extract resource check results if available
-            resource_target = None
-            for agent_name, check_result in agent_checks.items():
-                if 'resource_monitor' in agent_name.lower():
-                    resource_target = check_result.get('target')
-                    break
-            
-            # Extract connectivity check results if available
-            connectivity_target = None
-            for agent_name, check_result in agent_checks.items():
-                if 'connectivity' in agent_name.lower():
-                    connectivity_target = check_result.get('target')
-                    break
-            
-            # Log the agent recommendations
-            logger.debug(f"Agent recommendations - Connectivity: {connectivity_target}, Resources: {resource_target}")
-            
-            # Handle conflicting recommendations
-            target_type = None
-            
-            # If connectivity check suggests cloud but resources are constrained
-            if connectivity_target == 'cloud' and resource_target == 'local':
-                # Check if we need to override based on severity
-                severity = None
-                for agent_name, check_result in agent_checks.items():
-                    if 'resource_monitor' in agent_name.lower():
-                        severity = check_result.get('severity', 'medium')
-                        break
-                
-                # If resource constraint is severe, prioritize it over connectivity
-                if severity == 'high':
-                    logger.info("Resource constraints (high severity) override connectivity recommendation")
-                    target_type = ModelType.OLLAMA
-                else:
-                    # Otherwise follow connectivity recommendation
-                    target_type = ModelType.OPENAI
-            # Normal prioritization when no conflict
-            elif connectivity_target == 'local':
-                target_type = ModelType.OLLAMA
-            elif connectivity_target == 'cloud':
-                target_type = ModelType.OPENAI
-            elif resource_target == 'local':
-                target_type = ModelType.OLLAMA
-            elif resource_target == 'cloud':
-                target_type = ModelType.OPENAI
-            
-            # Select first model of target type if available
-            if target_type:
-                for model in self.models.values():
-                    if model.model_type == target_type:
-                        selected_model = model
-                        break
-                
-                logger.info(f"Selected model type: {target_type.value if target_type else 'none'}")
-            else:
-                logger.info("No specific model type recommended by agents")
-        
-        except Exception as e:
-            logger.warning(f"Error selecting model from agent checks: {e}")
-        
-        return selected_model
+    # The _select_model_from_agent_checks method has been removed
+    # All model selection logic is now handled exclusively in the ExecutionManager
 
     async def create_session(self, 
                            title: Optional[str] = None, 
-                           initial_context: Optional[Dict] = None) -> str:
+                           initial_context: Optional[Dict] = None,
+                           metadata: Optional[Dict[str, Any]] = None) -> str:
         """
         Create a new chat session with optional title and initial context.
         
         Args:
             title (Optional[str]): Optional session title
             initial_context (Optional[Dict]): Optional initial context dictionary
+            metadata (Optional[Dict[str, Any]]): Optional additional metadata
         
         Returns:
             str: New session ID
         """
         session_id = self.session_manager.create_session(
             title=title,
-            initial_context=initial_context
+            initial_context=initial_context,
+            metadata=metadata
         )
         return session_id
-
-    def list_sessions(self, limit: int = 50) -> List[Dict[str, Any]]:
+        
+    async def create_and_use_session(self, 
+                           title: Optional[str] = None, 
+                           initial_context: Optional[Dict] = None,
+                           metadata: Optional[Dict[str, Any]] = None) -> str:
         """
-        List recent chat sessions with metadata.
+        Create a new chat session and automatically set it as the current session.
+        
+        This convenience method creates a new session and sets it as the
+        current session, making it immediately available for conversation.
+        
+        Args:
+            title (Optional[str]): Optional session title
+            initial_context (Optional[Dict]): Optional initial context dictionary
+            metadata (Optional[Dict[str, Any]]): Optional additional metadata
+        
+        Returns:
+            str: New session ID (already set as current_session_id)
+        """
+        session_id = await self.create_session(
+            title=title,
+            initial_context=initial_context,
+            metadata=metadata
+        )
+        self.current_session_id = session_id
+        logger.info(f"Created and activated session: {session_id}")
+        return session_id
+
+    def use_session(self, session_id: str) -> bool:
+        """
+        Set an existing session as the current active session.
+        
+        Validates that the session exists and sets it as the active session
+        for future conversation interactions.
+        
+        Args:
+            session_id (str): Session identifier to activate
+            
+        Returns:
+            bool: True if session was successfully activated, False if not found
+        """
+        session_data = self.session_manager.load_session(session_id)
+        if not session_data:
+            logger.warning(f"Cannot activate session {session_id}: not found")
+            return False
+            
+        self.current_session_id = session_id
+        logger.info(f"Activated session: {session_id}")
+        return True
+
+    def list_sessions(self, limit: int = 50, filter_metadata: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """
+        List recent chat sessions with metadata and optional filtering.
         
         Args:
             limit (int): Maximum number of sessions to return
+            filter_metadata (Optional[Dict[str, Any]]): Optional metadata filters
+                to only return sessions matching specific criteria
         
         Returns:
             List[Dict[str, Any]]: List of session metadata dictionaries containing:
@@ -579,8 +639,9 @@ class OblixClient(OblixBaseClient):
                 - created_at: Creation timestamp
                 - updated_at: Last update timestamp
                 - message_count: Number of messages in the session
+                - metadata: Additional session metadata
         """
-        return self.session_manager.list_sessions(limit)
+        return self.session_manager.list_sessions(limit, filter_metadata)
 
     def load_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -605,6 +666,116 @@ class OblixClient(OblixBaseClient):
             bool: True if session was deleted successfully
         """
         return self.session_manager.delete_session(session_id)
+        
+    def update_session_metadata(self, session_id: str, metadata: Dict[str, Any]) -> bool:
+        """
+        Update or add metadata to a session.
+        
+        Updates existing metadata fields or adds new fields without
+        affecting other session data.
+        
+        Args:
+            session_id (str): Session identifier
+            metadata (Dict[str, Any]): Metadata fields to update or add
+            
+        Returns:
+            bool: True if metadata was updated successfully
+        """
+        return self.session_manager.update_session_metadata(session_id, metadata)
+        
+    def get_session_metadata(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get metadata for a specific session.
+        
+        Retrieves just the metadata fields for a session without
+        loading the entire conversation.
+        
+        Args:
+            session_id (str): Session identifier
+            
+        Returns:
+            Optional[Dict[str, Any]]: Session metadata if found
+        """
+        return self.session_manager.get_session_metadata(session_id)
+        
+    async def export_session(self, session_id: str, export_path: str) -> bool:
+        """
+        Export a session to a file.
+        
+        Exports a complete session to a JSON file that can be shared
+        or backed up.
+        
+        Args:
+            session_id (str): Session identifier
+            export_path (str): Path to save the exported session
+            
+        Returns:
+            bool: True if export was successful
+        """
+        return self.session_manager.export_session(session_id, export_path)
+        
+    async def import_session(self, import_path: str, new_id: bool = True, use_immediately: bool = False) -> Optional[str]:
+        """
+        Import a session from a file.
+        
+        Imports a session from a JSON file, optionally assigning a new ID
+        to avoid conflicts with existing sessions.
+        
+        Args:
+            import_path (str): Path to the JSON file to import
+            new_id (bool): Whether to assign a new ID (True) or keep original ID (False)
+            use_immediately (bool): Whether to set the imported session as the current session
+            
+        Returns:
+            Optional[str]: Session ID of the imported session, or None if import failed
+        """
+        session_id = self.session_manager.import_session(import_path, new_id)
+        if session_id and use_immediately:
+            self.current_session_id = session_id
+            logger.info(f"Imported and activated session: {session_id}")
+        return session_id
+        
+    async def merge_sessions(self, source_ids: List[str], title: Optional[str] = None, use_immediately: bool = False) -> Optional[str]:
+        """
+        Merge multiple sessions into a new session.
+        
+        Creates a new session containing all messages from the source sessions,
+        properly ordered by timestamp.
+        
+        Args:
+            source_ids (List[str]): List of session IDs to merge
+            title (Optional[str]): Optional title for the merged session
+            use_immediately (bool): Whether to set the merged session as the current session
+            
+        Returns:
+            Optional[str]: ID of the newly created merged session, or None if merge failed
+        """
+        session_id = self.session_manager.merge_sessions(source_ids, title)
+        if session_id and use_immediately:
+            self.current_session_id = session_id
+            logger.info(f"Created and activated merged session: {session_id}")
+        return session_id
+        
+    async def copy_session(self, session_id: str, new_title: Optional[str] = None, use_immediately: bool = False) -> Optional[str]:
+        """
+        Create a copy of an existing session.
+        
+        Creates a new session with the same content as an existing session
+        but with a new ID.
+        
+        Args:
+            session_id (str): Session identifier to copy
+            new_title (Optional[str]): Optional new title for the copied session
+            use_immediately (bool): Whether to set the copied session as the current session
+            
+        Returns:
+            Optional[str]: ID of the new copy, or None if copy failed
+        """
+        new_session_id = self.session_manager.copy_session(session_id, new_title)
+        if new_session_id and use_immediately:
+            self.current_session_id = new_session_id
+            logger.info(f"Copied and activated session: {new_session_id}")
+        return new_session_id
 
     async def start_chat(self, session_id: Optional[str] = None) -> str:
         """
@@ -625,8 +796,13 @@ class OblixClient(OblixBaseClient):
             - Use '/list' to see recent sessions
             - Use '/load <session_id>' to load a previous session
         """
-        # Validate all requirements are met
-        await self._validate_requirements()
+        try:
+            # Validate all requirements are met
+            await self._validate_requirements()
+        except Exception as e:
+            # Handle validation errors
+            print_error(f"Error starting chat: {e}")
+            return None
         
         # Create or load session
         if session_id:
@@ -691,15 +867,52 @@ class OblixClient(OblixBaseClient):
                         print(f"Could not load session: {load_id}")
                     continue
                 
-                # Execute prompt
+                # Execute prompt with streaming but don't display metrics (we'll show them later)
                 print("Thinking...")
-                result = await self.execute(user_input)
+                result = await self.execute_streaming(user_input, display_metrics=False)
                 
                 if result:
                     if "error" in result:
                         print(f"\nError: {result['error']}")
                     else:
-                        print(f"\nAssistant: {result['response']}")
+                        # Don't print the response again - it was already printed by execute_streaming
+                        # Skip directly to the JSON metrics
+                        import json
+                        
+                        # Format metrics using helper function
+                        enhanced_metrics = self.format_metrics(result.get("metrics", {}))
+                        
+                        model_id = result.get("model_id", "")
+                        model_type = model_id.split(":")[0] if ":" in model_id else ""
+                        model_name = model_id.split(":")[1] if ":" in model_id else model_id
+                        
+                        # Create a response object with the required fields
+                        response_json = {
+                            "response": result.get("response", ""),
+                            "model_name": model_name,
+                            "model_type": model_type,
+                            "time_to_first_token": enhanced_metrics.get("time_to_first_token"),
+                            "tokens_per_second": enhanced_metrics.get("tokens_per_second"),
+                            "latency": enhanced_metrics.get("total_latency"),
+                            "input_tokens": enhanced_metrics.get("input_tokens"),
+                            "output_tokens": enhanced_metrics.get("output_tokens")
+                        }
+                        
+                        # Remove null values
+                        response_json = {k: v for k, v in response_json.items() if v is not None}
+                            
+                        print(f"\nJSON response:\n{json.dumps(response_json, indent=2)}")
+                        
+                        # Print routing decisions if available
+                        if result.get('routing_decision'):
+                            resource_routing = result['routing_decision'].get('resource_routing')
+                            connectivity_routing = result['routing_decision'].get('connectivity_routing')
+                            
+                            print("\nRouting decisions:")
+                            if resource_routing:
+                                print(f"Resource: {{\n  'target': '{resource_routing.get('target')}',\n  'state': '{resource_routing.get('state')}',\n  'reason': '{resource_routing.get('reason')}'\n}}")
+                            if connectivity_routing:
+                                print(f"Connectivity: {{\n  'state': '{connectivity_routing.get('state')}',\n  'target': '{connectivity_routing.get('target')}',\n  'reason': '{connectivity_routing.get('reason')}'\n}}")
                 else:
                     print("\nSorry, I couldn't generate a response.")
                 
@@ -720,6 +933,73 @@ class OblixClient(OblixBaseClient):
             Dict[str, List[str]]: Dictionary mapping model types to lists of model names
         """
         return self.config_manager.list_models()
+    
+    def format_response(self, result: Dict[str, Any]) -> str:
+        """
+        Format response as pretty-printed JSON.
+        
+        Args:
+            result (Dict[str, Any]): Raw result from execute() method
+            
+        Returns:
+            str: Formatted response text
+        """
+        # Get the response content
+        response_data = result.get("response", "")
+        
+        # Handle nested response objects
+        if isinstance(response_data, dict) and "response" in response_data:
+            # Extract the actual response from the nested structure
+            response_text = response_data["response"]
+        else:
+            response_text = response_data
+            
+        # No longer displaying routing decisions here, moved to the calling functions
+        
+        return response_text
+        
+    def format_metrics(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Format metrics dictionary to ensure consistent output across streaming and non-streaming modes.
+        
+        Args:
+            metrics (Dict[str, Any]): Raw metrics dictionary
+            
+        Returns:
+            Dict[str, Any]: Enhanced metrics dictionary with all required fields
+        """
+        # Check if essential metrics are present
+        has_metrics = (metrics and 
+                      metrics.get("total_latency") is not None)
+        
+        if not has_metrics:
+            # Return metrics with all fields set to None if no metrics are available yet
+            return {
+                "total_latency": None,
+                "tokens_per_second": None,
+                "start_time": None,
+                "end_time": None,
+                "input_tokens": None,
+                "output_tokens": None,
+                "model_name": None,
+                "model_type": None,
+                "time_to_first_token": None
+            }
+            
+        # Create enhanced metrics dictionary with all requested fields
+        enhanced_metrics = {
+            "total_latency": metrics.get("total_latency"),
+            "tokens_per_second": metrics.get("tokens_per_second"),
+            "start_time": metrics.get("start_time"),
+            "end_time": metrics.get("end_time"),
+            "input_tokens": metrics.get("input_tokens"),
+            "output_tokens": metrics.get("output_tokens"),
+            "model_name": metrics.get("model_name"),
+            "model_type": metrics.get("model_type"),
+            "time_to_first_token": metrics.get("time_to_first_token")
+        }
+        
+        return enhanced_metrics
     
     async def get_resource_metrics(self) -> Dict[str, Any]:
         """
@@ -798,3 +1078,75 @@ class OblixClient(OblixBaseClient):
             result["session_id"] = session_id
         
         return result
+        
+    async def cleanup(self):
+        """
+        Clean up all resources used by the client.
+        
+        This method ensures proper cleanup of all async resources, 
+        including HTTP sessions, connections, and any pending tasks.
+        
+        Call this method when shutting down the client to prevent 
+        resource leaks and event loop warnings.
+        """
+        logger.info("Cleaning up client resources...")
+        
+        try:
+            # Close all model connections if available
+            for model_key, model in self.models.items():
+                try:
+                    if hasattr(model, 'close') and callable(model.close):
+                        await model.close()
+                    elif hasattr(model, 'cleanup') and callable(model.cleanup):
+                        await model.cleanup()
+                    logger.info(f"Closed model: {model_key}")
+                except Exception as e:
+                    logger.error(f"Error closing model {model_key}: {e}")
+            
+            # Close execution manager if available
+            if hasattr(self, 'execution_manager'):
+                try:
+                    if hasattr(self.execution_manager, 'close') and callable(self.execution_manager.close):
+                        await self.execution_manager.close()
+                    logger.info("Closed execution manager")
+                except Exception as e:
+                    logger.error(f"Error closing execution manager: {e}")
+            
+            # Auth has been removed
+            
+            # Find and close any other aiohttp sessions - do this safely to avoid proxy object issues
+            try:
+                import inspect
+                for obj in gc.get_objects():
+                    # Only check objects that are actually aiohttp.ClientSession instances
+                    # This avoids issues with proxy objects or other objects that might raise errors
+                    if not inspect.isclass(obj) and obj.__class__.__name__ == 'ClientSession':
+                        if hasattr(obj, 'closed') and not obj.closed:
+                            try:
+                                await obj.close()
+                                # Silent success
+                            except Exception:
+                                # Silent failure
+                                pass
+            except Exception:
+                # Silent failure
+                pass
+            
+            # Cancel any pending tasks
+            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            if tasks:
+                for task in tasks:
+                    task.cancel()
+                
+                # Wait for tasks to be cancelled
+                await asyncio.gather(*tasks, return_exceptions=True)
+                
+            # Silent completion
+            
+        except Exception:
+            # Silent failure
+            pass
+            
+    async def shutdown(self):
+        """Alias for cleanup() - ensures compatibility with other frameworks"""
+        await self.cleanup()

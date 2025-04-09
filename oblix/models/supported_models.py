@@ -24,22 +24,40 @@ SUPPORTED_OPENAI_MODELS: List[Dict[str, str]] = [
 
 SUPPORTED_CLAUDE_MODELS: List[Dict[str, str]] = [
     {
-        "name": "claude-3-opus-20240229",
-        "description": "Most powerful Claude model",
+        "name": "claude-3-7-sonnet-20250219",
+        "description": "Latest and most capable Claude model",
         "context_window": "200K tokens",
-        "features": "Complex tasks, code analysis, long-form content"
+        "features": "Superior reasoning, code, and creative tasks"
     },
     {
-        "name": "claude-3-sonnet-20240229",
-        "description": "Balanced performance model",
+        "name": "claude-3-5-sonnet-20241022",
+        "description": "Improved Claude 3.5 sonnet model",
         "context_window": "200K tokens",
-        "features": "Fast, high quality, good reasoning"
+        "features": "Strong general purpose assistant"
+    },
+    {
+        "name": "claude-3-5-haiku-20241022",
+        "description": "Improved Claude 3.5 haiku model",
+        "context_window": "200K tokens",
+        "features": "Fast responses for simpler tasks"
+    },
+    {
+        "name": "claude-3-5-sonnet-20240620",
+        "description": "Claude 3.5 sonnet model (June 2024)",
+        "context_window": "200K tokens",
+        "features": "Balanced performance model"
     },
     {
         "name": "claude-3-haiku-20240307",
-        "description": "Fastest Claude model",
+        "description": "Claude 3 haiku model",
         "context_window": "200K tokens",
         "features": "Quick responses, everyday tasks"
+    },
+    {
+        "name": "claude-3-opus-20240229",
+        "description": "Original Claude 3 opus model",
+        "context_window": "200K tokens",
+        "features": "Complex tasks, code analysis, long-form content"
     }
 ]
 
@@ -56,6 +74,15 @@ def is_model_supported(provider: str, model_name: str) -> bool:
     if provider.lower() == "ollama":
         # For Ollama, we don't maintain a static list as it's dynamic
         return True  # Allow any model name as it's verified during runtime
-        
+    
     models = get_supported_models(provider)
-    return any(model["name"] == model_name for model in models)
+    is_supported = any(model["name"] == model_name for model in models)
+    
+    # For Claude, be more permissive - new models are released frequently
+    # and we want to support them without code changes
+    if provider.lower() == "claude":
+        # Accept all Claude models that follow the standard naming pattern
+        if model_name.startswith("claude-"):
+            return True
+            
+    return is_supported
