@@ -1,0 +1,9 @@
+services:
+  oblix:
+    container_name: oblix
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8140:8140"
+    restart: unless-stopped

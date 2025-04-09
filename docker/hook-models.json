@@ -1,0 +1,12 @@
+[
+  {
+    "type": "OLLAMA",
+    "model": "qwen2.5-coder:14b",
+    "endpoint": "http://localhost:11434"
+  },
+  {
+    "type": "OLLAMA",
+    "model": "gemma3:12b",
+    "endpoint": "http://localhost:11434"
+  }
+]
